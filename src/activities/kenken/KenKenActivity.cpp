@@ -336,60 +336,81 @@ void KenKenActivity::drawNotes(const int r, const int c, const int cellX, const 
   const uint8_t mask = notes_[r][c];
   if (mask == 0) return;
   const int n = puzzle_.n();
-
-  // Minimum note scale per board. This is only a floor: the loop below takes
-  // the largest scale that actually fits the cell, so a wide 4x4 cell ends up
-  // bigger than a tight 6x6 one without hard-coding a size per orientation.
-  static constexpr int kMinScale[3] = {
-      3,  // 4x4: ~110 px portrait cells
-      3,  // 5x5: ~88 px
-      2,  // 6x6: ~73 px
-  };
-  const int minScale = kMinScale[n - 4];
+  const int marks = __builtin_popcount(static_cast<unsigned>(mask & 0xFF));
 
   const int ci = puzzle_.cageOf(r, c);
   const bool hasLabel =
       ci >= 0 && puzzle_.cage(ci).op != '=' && puzzle_.cage(ci).labelCell == r * n + c;
   const int topReserve = hasLabel ? 18 : 6;  // cage label occupies the cell's top-left
 
-  // Layout: up to three marks per row, comma-separated, e.g. "1,2,3" over "4".
-  // Three per row matters on 4x4: with two per row a third mark wrapped onto a
-  // second line, which read as if the list had ended. The comma sits between
-  // marks *within* a row, so a wrapped row never leaves a dangling separator.
-  static constexpr int kPerRow = 3;
+  // Layout is chosen per cell from the number of marks actually set, not from
+  // the board size: with one or two marks a single row is both roomier and
+  // clearer, and forcing a wrap there would just shrink the digits for nothing.
+  // Three or more stay on one row only if that row is still as large as the
+  // wrapped alternative — otherwise wrap, because a row that has to shrink to
+  // fit reads worse than a second line.
   static constexpr int kSideMargin = 4;  // breathing room at the cell edges
 
-  // A comma slot after each mark but the last. Width of a full row is
-  // kPerRow marks plus (kPerRow - 1) commas, each `commaW` wide.
   auto commaW = [](const int s) { return s + 1; };  // narrow: comma + 1px
-  auto layoutW = [&](const int s, const int g) {
-    return kPerRow * 5 * s + (kPerRow - 1) * (commaW(s) + g);
+  auto rowW = [&](const int s, const int g, const int marks) {
+    return marks * 5 * s + (marks - 1) * (commaW(s) + g);
   };
-  const int rowsNeeded = (n + kPerRow - 1) / kPerRow;  // worst case: all marks set
-  auto layoutH = [](const int s, const int g, const int rows) { return rows * 7 * s + (rows - 1) * g; };
-  auto fits = [&](const int s, const int g) {
-    return layoutW(s, g) + 2 * kSideMargin <= cellSize_ &&
-           layoutH(s, g, rowsNeeded) + 5 + topReserve <= cellSize_;
+  auto blockH = [](const int s, const int g, const int rows) {
+    return rows * 7 * s + (rows - 1) * g;
   };
 
-  // Use the largest scale that fits, starting from the board's minimum so a
-  // cramped board never falls below something legible.
-  int scale = minScale;
-  while (fits(scale + 1, 1) && scale < 9) ++scale;
-  while (scale > 1 && !fits(scale, 1)) --scale;
-  if (!fits(scale, 1)) scale = 1;
-  const int gap = std::max(1, scale);  // 1 glyph-column of space, scaled
+  // The gap is one glyph column, so it scales with the digits. The fit test has
+  // to use that same value — testing with gap 1 while drawing with gap = scale
+  // under-estimates the width and can push the block past the side margin.
+  auto gapFor = [](const int s) { return std::max(1, s); };
+  // Notes are annotations, so keep them clearly subordinate to a committed
+  // value (which draws at up to scale 9 in a 4x4 cell). Capped at roughly two
+  // thirds of the value size: at full size a single pencil mark is
+  // indistinguishable from an entered digit, which is the one thing a note must
+  // never look like.
+  const int valueScale = std::max(2, cellSize_ / (hasLabel ? 15 : 12));
+  const int noteScaleCap = std::max(2, (valueScale * 2) / 3);
+  auto largestScale = [&](const int perRow) {
+    const int rows = (marks + perRow - 1) / perRow;
+    auto fits = [&](const int s) {
+      if (s > noteScaleCap) return false;
+      const int g = gapFor(s);
+      return rowW(s, g, perRow) + 2 * kSideMargin <= cellSize_ &&
+             blockH(s, g, rows) + 5 + topReserve <= cellSize_;
+    };
+    int best = 1;
+    for (int s = 1; s <= 9 && fits(s); ++s) best = s;
+    return best;
+  };
+
+  // Candidate layouts: everything on one row, or wrapped three per row.
+  const int oneRowScale = largestScale(marks);
+  const int wrappedScale = marks > 3 ? largestScale(3) : 0;
+
+  int perRow;
+  int scale;
+  if (oneRowScale >= wrappedScale) {
+    perRow = marks;  // single row reads as one list; prefer it on a tie
+    scale = oneRowScale;
+  } else {
+    perRow = 3;
+    scale = wrappedScale;
+  }
+  if (scale < 1) scale = 1;
+  const int rows = (marks + perRow - 1) / perRow;
+  const int gap = gapFor(scale);
+  const int rowsNeeded = rows;
 
   const int slotStepX = 5 * scale + commaW(scale) + gap;
   const int slotStepY = 7 * scale + gap;
-  const int startX = cellX + (cellSize_ - layoutW(scale, gap)) / 2;
-  const int startY = cellY + cellSize_ - 5 - layoutH(scale, gap, rowsNeeded);
+  const int startX = cellX + (cellSize_ - rowW(scale, gap, perRow)) / 2;
+  const int startY = cellY + cellSize_ - 5 - blockH(scale, gap, rowsNeeded);
 
   int slot = 0;
   for (int v = 1; v <= n; ++v) {
     if (!(mask & (1u << v))) continue;
-    const int row = slot / kPerRow;
-    const int col = slot % kPerRow;
+    const int row = slot / perRow;
+    const int col = slot % perRow;
     const int x = startX + col * slotStepX;
     const int y = startY + row * slotStepY;
     // Comma sits between this mark and the previous one, low on the baseline.
