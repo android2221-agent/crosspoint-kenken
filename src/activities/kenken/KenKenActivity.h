@@ -96,6 +96,9 @@ class KenKenActivity final : public Activity {
   // Clears and redraws the status text. Returns the (logical) rect it cleared,
   // which covers both the old and new text so partial repaints leave no glyphs.
   Rect drawStatusLine();
+  // Blits a 5x7 column-major-free glyph (bit 4 = leftmost column) at `scale`.
+  // Shared by the digits and the comma separator between pencil marks.
+  void drawGlyph(const uint8_t* glyph, int x, int y, int scale, bool black);
   void drawBigDigit(int value, int x, int y, int scale, bool black);
   void drawNotes(int r, int c, int cellX, int cellY, bool black);
   void drawClue(int r, int c, int cellX, int cellY, bool black);

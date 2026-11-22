@@ -30,6 +30,12 @@ const uint8_t kDigits[10][7] = {
 const char* kLevelNames[] = {"4x4", "5x5", "6x6"};
 constexpr int kLevelCount = 3;
 
+// Separator drawn between pencil marks so adjacent candidates read as "1,2,3"
+// rather than a run of digits. Same 5x7 cell as the digit glyphs (bit 4 is the
+// leftmost column); only the baseline rows carry pixels, so it scales with the
+// digits without competing with them.
+const uint8_t kCommaGlyph[7] = {0x00, 0x00, 0x00, 0x00, 0x06, 0x04, 0x08};
+
 }  // namespace
 
 int KenKenActivity::levelSize(const int levelIndex) { return 4 + levelIndex; }
@@ -120,15 +126,24 @@ void KenKenActivity::loop() {
   }
 
   if (editing_) {
-    if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
-      candidate_ = (candidate_ - 1 + (n + 1)) % (n + 1);
+    // Candidate selection. The front Left/Right buttons and the side Up/Down
+    // buttons both step through 1..n then blank, so either hand can drive it:
+    // the side buttons are far easier to reach while holding the device.
+    int delta = 0;
+    if (mappedInput.wasReleased(MappedInputManager::Button::Left) ||
+        mappedInput.wasReleased(MappedInputManager::Button::Down)) {
+      delta = -1;
+    } else if (mappedInput.wasReleased(MappedInputManager::Button::Right) ||
+               mappedInput.wasReleased(MappedInputManager::Button::Up)) {
+      delta = +1;
+    }
+    if (delta != 0) {
+      candidate_ = (candidate_ + delta + (n + 1)) % (n + 1);
       markDirty(curRow_, curCol_);
       requestUpdate();
-    } else if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
-      candidate_ = (candidate_ + 1) % (n + 1);
-      markDirty(curRow_, curCol_);
-      requestUpdate();
-    } else if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+      return;
+    }
+    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
       const int before = values_[curRow_][curCol_];
       const bool wasChecked = checked_;
       // Tap = pencil mark, hold = real value (see LONG_PRESS_MS). Measured on
@@ -288,17 +303,21 @@ void KenKenActivity::loop() {
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
-void KenKenActivity::drawBigDigit(const int value, const int x, const int y, const int scale, const bool black) {
-  if (value < 0 || value > 9) return;
-  const uint8_t* glyph = kDigits[value];
+void KenKenActivity::drawGlyph(const uint8_t* glyph, const int x, const int y, const int scale, const bool black) {
   for (int row = 0; row < 7; ++row) {
     const uint8_t bits = glyph[row];
+    if (bits == 0) continue;
     for (int col = 0; col < 5; ++col) {
       if (bits & (1u << (4 - col))) {
         renderer.fillRect(x + col * scale, y + row * scale, scale, scale, black);
       }
     }
   }
+}
+
+void KenKenActivity::drawBigDigit(const int value, const int x, const int y, const int scale, const bool black) {
+  if (value < 0 || value > 9) return;
+  drawGlyph(kDigits[value], x, y, scale, black);
 }
 
 void KenKenActivity::drawClue(const int r, const int c, const int cellX, const int cellY, const bool black) {
@@ -333,15 +352,24 @@ void KenKenActivity::drawNotes(const int r, const int c, const int cellX, const 
   };
   const NoteStyle preferred = kNoteStyle[n - 4];
 
-  const int rowsNeeded = (n + 2) / 3;
   const int ci = puzzle_.cageOf(r, c);
   const bool hasLabel =
       ci >= 0 && puzzle_.cage(ci).op != '=' && puzzle_.cage(ci).labelCell == r * n + c;
   const int topReserve = hasLabel ? 18 : 6;  // cage label occupies the cell's top-left
 
-  // The 3-wide marker block for a given scale/gap.
-  auto layoutW = [](const int s, const int g) { return 2 * (5 * s + g) + 5 * s; };
-  auto layoutH = [](const int s, const int g, const int rows) { return (rows - 1) * (7 * s + g) + 7 * s; };
+  // Layout: up to two marks per row, with a comma between them inside a row,
+  // e.g. "1,2" over "3,4". Keeping the comma within a row (rather than one
+  // separator spanning a wrapped list) is what makes two-per-row affordable:
+  // at 5x5 three marks plus two commas will not fit at scale 3, but two marks
+  // plus one comma will.
+  static constexpr int kPerRow = 2;
+
+  auto groupW = [](const int s, const int g, const int count) {
+    return count * 5 * s + (count - 1) * (s + g);  // count marks, count-1 commas
+  };
+  auto layoutW = [&](const int s, const int g) { return groupW(s, g, kPerRow); };
+  const int rowsNeeded = (n + kPerRow - 1) / kPerRow;  // worst case: all marks set
+  auto layoutH = [](const int s, const int g, const int rows) { return rows * 7 * s + (rows - 1) * g; };
   auto fits = [&](const int s, const int g) {
     return layoutW(s, g) + 8 <= cellSize_ && layoutH(s, g, rowsNeeded) + 5 + topReserve <= cellSize_;
   };
@@ -364,20 +392,23 @@ void KenKenActivity::drawNotes(const int r, const int c, const int cellX, const 
     gap = 1;
   }
 
-  const int digitW = 5 * scale;
-  const int digitH = 7 * scale;
-  const int stepX = digitW + gap;
-  const int stepY = digitH + gap;
+  // Advance per mark slot is a digit plus the space a comma needs after it.
+  const int slotStepX = 5 * scale + gap + (scale + 1);
+  const int slotStepY = 7 * scale + gap;
   const int startX = cellX + (cellSize_ - layoutW(scale, gap)) / 2;
   const int startY = cellY + cellSize_ - 5 - layoutH(scale, gap, rowsNeeded);
 
-  int index = 0;
+  int slot = 0;
   for (int v = 1; v <= n; ++v) {
     if (!(mask & (1u << v))) continue;
-    const int col = index % 3;
-    const int row = index / 3;
-    drawBigDigit(v, startX + col * stepX, startY + row * stepY, scale, black);
-    ++index;
+    const int row = slot / kPerRow;
+    const int col = slot % kPerRow;
+    const int x = startX + col * slotStepX;
+    const int y = startY + row * slotStepY;
+    // Comma sits in the gap after the previous mark, vertically low.
+    if (col > 0) drawGlyph(kCommaGlyph, x - (scale + 1) - gap, y, scale, black);
+    drawBigDigit(v, x, y, scale, black);
+    ++slot;
   }
 }
 
