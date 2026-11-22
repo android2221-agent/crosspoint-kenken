@@ -318,34 +318,58 @@ void KenKenActivity::drawNotes(const int r, const int c, const int cellX, const 
   if (mask == 0) return;
   const int n = puzzle_.n();
 
-  // Pencil marks were drawn at scale 1 (a 5x7 px glyph), which is too small to
-  // read on the panel. Draw them double size, but only where a full 3-wide row
-  // of them still fits: the smallest case is 6x6 in landscape (~48 px cells),
-  // and a cell that also carries a cage label has to leave room for it at the
-  // top. Rather than hard-code a scale per level, take the largest one that
-  // fits and fall back, so every orientation and board size stays legible.
-  const int kGap = 2;
+  // Preferred note size per board, from the widest cells to the tightest:
+  // 4x4 gets the largest digits with the most space between them, 5x5 steps
+  // down one notch, and 6x6 keeps the sizing that was already in use. Index is
+  // n - 4, matching levelSize().
+  struct NoteStyle {
+    int scale;
+    int gap;
+  };
+  static constexpr NoteStyle kNoteStyle[3] = {
+      {3, 5},  // 4x4: ~110 px cells in portrait, room to breathe
+      {3, 3},  // 5x5: ~88 px, slightly tighter
+      {2, 2},  // 6x6: ~73 px, unchanged
+  };
+  const NoteStyle preferred = kNoteStyle[n - 4];
+
   const int rowsNeeded = (n + 2) / 3;
   const int ci = puzzle_.cageOf(r, c);
   const bool hasLabel =
       ci >= 0 && puzzle_.cage(ci).op != '=' && puzzle_.cage(ci).labelCell == r * n + c;
   const int topReserve = hasLabel ? 18 : 6;  // cage label occupies the cell's top-left
 
-  auto layoutW = [&](const int s) { return 2 * (5 * s + kGap) + 5 * s; };  // 3 columns
-  auto layoutH = [&](const int s) { return (rowsNeeded - 1) * (7 * s + kGap) + 7 * s; };
-  auto fits = [&](const int s) {
-    return layoutW(s) + 8 <= cellSize_ && layoutH(s) + 5 + topReserve <= cellSize_;
+  // The 3-wide marker block for a given scale/gap.
+  auto layoutW = [](const int s, const int g) { return 2 * (5 * s + g) + 5 * s; };
+  auto layoutH = [](const int s, const int g, const int rows) { return (rows - 1) * (7 * s + g) + 7 * s; };
+  auto fits = [&](const int s, const int g) {
+    return layoutW(s, g) + 8 <= cellSize_ && layoutH(s, g, rowsNeeded) + 5 + topReserve <= cellSize_;
   };
 
-  int scale = 1;
-  if (fits(2)) scale = 2;
+  // Honour the preference where it fits, then step down until it does. This
+  // keeps landscape (much shorter cells) and labelled cells from overflowing
+  // without hard-coding a size per orientation.
+  int scale = preferred.scale;
+  int gap = preferred.gap;
+  while (scale > 1 && !fits(scale, gap)) {
+    if (gap > 1) {
+      --gap;
+    } else {
+      --scale;
+      gap = preferred.gap < 2 ? 2 : preferred.gap;
+    }
+  }
+  if (!fits(scale, gap)) {
+    scale = 1;
+    gap = 1;
+  }
 
   const int digitW = 5 * scale;
   const int digitH = 7 * scale;
-  const int stepX = digitW + kGap;
-  const int stepY = digitH + kGap;
-  const int startX = cellX + (cellSize_ - layoutW(scale)) / 2;
-  const int startY = cellY + cellSize_ - 5 - layoutH(scale);
+  const int stepX = digitW + gap;
+  const int stepY = digitH + gap;
+  const int startX = cellX + (cellSize_ - layoutW(scale, gap)) / 2;
+  const int startY = cellY + cellSize_ - 5 - layoutH(scale, gap, rowsNeeded);
 
   int index = 0;
   for (int v = 1; v <= n; ++v) {
