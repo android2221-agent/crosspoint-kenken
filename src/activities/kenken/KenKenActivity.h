@@ -40,15 +40,21 @@ class KenKenActivity final : public Activity {
 
  private:
   static constexpr int MAX_N = KenKenPuzzle::MAX_N;
-  static constexpr int TOOL_COUNT = 4;
-  enum Tool { TOOL_LEVEL = 0, TOOL_NOTES = 1, TOOL_CHECK = 2, TOOL_NEW = 3 };
+  static constexpr int TOOL_COUNT = 3;
+  // Edit mode: a tap on Confirm commits the candidate as a pencil mark, a hold
+  // commits it as the real value. The value is the permanent action, so it gets
+  // the deliberate gesture — a tap can never lock in a wrong digit. This
+  // replaces the old Notes on/off toolbar mode, which forced a round trip to
+  // the toolbar before any value could be entered.
+  static constexpr unsigned long LONG_PRESS_MS = 400;
+  enum Tool { TOOL_LEVEL = 0, TOOL_CHECK = 1, TOOL_NEW = 2 };
 
   KenKenPuzzle puzzle_;
   int8_t values_[MAX_N][MAX_N] = {};
   uint8_t notes_[MAX_N][MAX_N] = {};  // candidate bitmask, bit v = value v
 
-  int levelIndex_ = 2;  // index into kLevels_
-  bool notesMode_ = false;
+  // Start on the easiest board: index 0 of kLevelNames{"4x4","5x5","6x6"}.
+  int levelIndex_ = 0;  // index into kLevels_
   int curRow_ = 0;  // -1 = toolbar row
   int curCol_ = 0;
   int toolIndex_ = 0;

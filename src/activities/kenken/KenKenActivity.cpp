@@ -131,7 +131,11 @@ void KenKenActivity::loop() {
     } else if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
       const int before = values_[curRow_][curCol_];
       const bool wasChecked = checked_;
-      if (notesMode_) {
+      // Tap = pencil mark, hold = real value (see LONG_PRESS_MS). Measured on
+      // release, so holding then letting go still commits.
+      const bool asValue = mappedInput.getHeldTime() >= LONG_PRESS_MS;
+
+      if (!asValue) {
         // Pencil marks only mean anything on an empty cell; on a filled cell
         // they are invisible (the value is drawn over them) so ignore them.
         if (candidate_ > 0 && before == 0) notes_[curRow_][curCol_] ^= static_cast<uint8_t>(1u << candidate_);
@@ -143,6 +147,25 @@ void KenKenActivity::loop() {
         // corrupt the count and could trigger a bogus "solved").
         if (before == 0 && candidate_ != 0) ++filled_;
         if (before != 0 && candidate_ == 0) --filled_;
+
+        // Strip this value from the pencil marks of every other cell in the row
+        // and column. KenKen's row/column rule is the same as a Latin square's,
+        // so a committed digit can never be a valid candidate elsewhere in
+        // either line; leaving those marks behind just fills the board with
+        // candidates that have already been disproven.
+        if (candidate_ > 0) {
+          const uint8_t clearedBit = static_cast<uint8_t>(~(1u << candidate_));
+          for (int i = 0; i < n; ++i) {
+            if (i != curCol_ && notes_[curRow_][i] != 0) {
+              notes_[curRow_][i] &= clearedBit;
+              dirty_[curRow_][i] = true;
+            }
+            if (i != curRow_ && notes_[i][curCol_] != 0) {
+              notes_[i][curCol_] &= clearedBit;
+              dirty_[i][curCol_] = true;
+            }
+          }
+        }
       }
       wrong_[curRow_][curCol_] = false;
       if (wasChecked) {
@@ -226,10 +249,6 @@ void KenKenActivity::loop() {
           fullRedraw_ = true;
           newPuzzle();
           return;
-        case TOOL_NOTES:
-          notesMode_ = !notesMode_;
-          markAllDirty();
-          break;
         case TOOL_CHECK: {
           checked_ = true;
           int bad = 0;
@@ -424,7 +443,6 @@ void KenKenActivity::drawToolbar() {
   const int pillW = (pageW - 2 * margin - (TOOL_COUNT - 1) * gap) / TOOL_COUNT;
   char labels[TOOL_COUNT][16];
   snprintf(labels[TOOL_LEVEL], sizeof(labels[0]), "%s", kLevelNames[levelIndex_]);
-  snprintf(labels[TOOL_NOTES], sizeof(labels[0]), "%s", notesMode_ ? "Notes:on" : "Notes:off");
   snprintf(labels[TOOL_CHECK], sizeof(labels[0]), "Check");
   snprintf(labels[TOOL_NEW], sizeof(labels[0]), "New");
 
@@ -490,7 +508,11 @@ void KenKenActivity::drawAll() {
 
   // Keep the hint bar independent of editing_: partial repaints never touch it,
   // so a mode-dependent bar would be left showing the previous mode's labels.
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
+  // Confirm now means "note" on a tap and "set the value" on a hold. Keep the
+  // label short: drawButtonHints draws a fixed 80 px button and does not clip,
+  // so anything longer bleeds past the border. The tap/hold distinction is
+  // spelled out in the app's README and the status line instead.
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), "Note/Set", tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 }
 
