@@ -17,10 +17,13 @@ The app lives in `src/activities/kenken/` and is registered in
 - `KenKenActivity.{h,cpp}` — Activity + drawing. `loop()` only mutates state and
   sets dirty flags; `render()` composes into the persistent framebuffer and
   pushes a window to the panel.
-- `lib/GfxRenderer` `displayWindow(x,y,w,h)` + `lib/hal/HalDisplay` passthrough —
-  logical rect → panel rect, byte-aligned, windowed RAM write + fast refresh.
-  `open-x4-sdk/.../EInkDisplay.cpp` implements it; X3 falls back to a full
-  `displayBuffer` internally.
+- Repaint path: draw the dirty cells into the persistent framebuffer, then commit
+  with `renderer.displayBuffer(HalDisplay::FAST_REFRESH)` — a full frame through
+  the same path every other screen uses. `GfxRenderer::displayWindow` /
+  `HalDisplay::displayWindow` exist but are **unused**: the SDK windowed path is
+  EXPERIMENTAL, was never called by a shipping activity, and drives the generic
+  fast-refresh sequence instead of the SSD1677 partial-update sequence
+  (`0x21 = 0x00`, `0x22 = 0xFC`). Do not reintroduce it without hardware proof.
 
 Invariants — breaking these causes visible corruption, not just bugs:
 
@@ -28,14 +31,15 @@ Invariants — breaking these causes visible corruption, not just bugs:
    main task while `render()` transfers to the panel for ~200 ms; clearing
    afterwards swallows input handled in that window.
 2. A cell repaint is only valid because the framebuffer still holds the rest of
-   the screen. Never `clearScreen()` inside a partial path, and never push a
-   window whose rectangle has not been fully drawn into the framebuffer.
+   the screen. Never `clearScreen()` inside the incremental path, and never
+   commit a frame whose dirty rectangles have not been drawn.
 3. Each cell draws only its **top and left** cage edges (bottom/right only on the
    outer frame). Drawing both neighbours' edges yields 6 px boundaries.
 4. Givens (single-cell cages) live in `KenKenPuzzle`, not in `values_`; read cell
    contents through `cellValue()` and count clues when initialising `filled_`.
 5. `displayWindow` must reject/clamp off-panel rectangles *before* widening to
-   8-pixel boundaries, or a negative coordinate rounds up into a valid column.
+   8-pixel boundaries, or a negative coordinate rounds up into a valid column
+   (kept correct even though nothing calls it now).
 
 Build/flash commands are in `README.md`; `pio run -e default` is the only env that
 matters for X4/X3. There is no simulator here, so after changing drawing code say

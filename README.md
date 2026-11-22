@@ -23,7 +23,7 @@ power), no touchscreen.
 | KenKen game (UI, input, repaint logic) | `src/activities/kenken/KenKenActivity.{h,cpp}` |
 | Puzzle generator + uniqueness solver | `src/activities/kenken/KenKenPuzzle.{h,cpp}` |
 | App registration + menu icon | `src/activities/AppRegistry.cpp`, `src/components/themes/{BaseTheme.h,lyra/LyraTheme.cpp}`, `src/components/icons/kenken{24,32}.h` |
-| Windowed panel updates | `lib/GfxRenderer/GfxRenderer.{h,cpp}` (`displayWindow`), `lib/hal/HalDisplay.{h,cpp}` (passthrough) |
+| Windowed panel-update helper (present, **unused** — see "Refresh behaviour") | `lib/GfxRenderer/GfxRenderer.{h,cpp}` (`displayWindow`), `lib/hal/HalDisplay.{h,cpp}` (passthrough) |
 
 Base is CrossPoint **1.3.0** (`[crosspoint] version` in `platformio.ini`). It does
 **not** include upstream CrossPoint 2.0's SD-plugin system or dictionary — this is
@@ -42,24 +42,31 @@ the apps fork plus KenKen.
 Cages show `11+`, `3-`, `24*`, `4/` in the top-left cell; single-cell cages are
 printed as a plain given digit.
 
-## Refresh behaviour (the interesting part)
+## Refresh behaviour
 
-E-ink does not need a full-screen flash per keypress, and this build doesn't do
-one. After the first full paint:
+E-ink does not need a full-screen *flash* per keypress, and this build doesn't do
+one — but it deliberately does commit a full frame:
 
-- a cursor move repaints the two touched cells (73x73 px each) and pushes one
-  window;
-- a value commit repaints one cell plus the status band when its text changes;
-- every 100 partial updates (and on New / level change) the panel gets a
-  `FULL_REFRESH` to clear accumulated ghosting;
-- toolbar navigation still does a whole-frame `FAST_REFRESH` — that is exactly
-  what makes the stock menus look non-flashing.
+- drawing is per-cell: a cursor move redraws two cells (73x73 px) into the
+  persistent framebuffer, a value commit redraws one cell plus the status band;
+- the commit is one ordinary `displayBuffer(FAST_REFRESH)` — the same path every
+  other screen in the firmware uses, which is why it looks like menu navigation
+  rather than a flash;
+- every 100 input-driven repaints (and on New / level change) the panel gets a
+  `FULL_REFRESH` to clear accumulated ghosting.
 
-`GfxRenderer::displayWindow(x, y, w, h)` takes *logical portrait* coordinates,
-rotates both corners into panel space, widens x to 8-pixel boundaries, clamps,
-and calls `HalDisplay::displayWindow`, which writes only that rectangle into
-controller RAM and runs a fast refresh. On X3 the SDK routes the same call
-through a full `displayBuffer`, so it still works there.
+The dirty-rect bookkeeping keeps drawing cheap; only the panel transfer is a full
+frame (~48 KB, ~12 ms).
+
+A windowed commit (`GfxRenderer::displayWindow` → `HalDisplay::displayWindow` →
+`EInkDisplay::displayWindow`) exists in the tree but is **not used**. It was tried
+first and reverted: upstream marks that SDK path EXPERIMENTAL, its declaration in
+`GfxRenderer` was commented out, no shipping activity had ever called it, and it
+drives the panel with the generic fast-refresh sequence rather than the
+partial-update sequence (`0x21 = 0x00`, `0x22 = 0xFC`) the SSD1677 guide specifies
+for bounded updates — so a windowed refresh does not get the temperature-loaded
+waveform a partial update expects. Full-frame commits are correct by
+construction.
 
 ## Build and flash
 
