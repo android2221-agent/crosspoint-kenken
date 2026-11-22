@@ -337,63 +337,50 @@ void KenKenActivity::drawNotes(const int r, const int c, const int cellX, const 
   if (mask == 0) return;
   const int n = puzzle_.n();
 
-  // Preferred note size per board, from the widest cells to the tightest:
-  // 4x4 gets the largest digits with the most space between them, 5x5 steps
-  // down one notch, and 6x6 keeps the sizing that was already in use. Index is
-  // n - 4, matching levelSize().
-  struct NoteStyle {
-    int scale;
-    int gap;
+  // Minimum note scale per board. This is only a floor: the loop below takes
+  // the largest scale that actually fits the cell, so a wide 4x4 cell ends up
+  // bigger than a tight 6x6 one without hard-coding a size per orientation.
+  static constexpr int kMinScale[3] = {
+      3,  // 4x4: ~110 px portrait cells
+      3,  // 5x5: ~88 px
+      2,  // 6x6: ~73 px
   };
-  static constexpr NoteStyle kNoteStyle[3] = {
-      {3, 5},  // 4x4: ~110 px cells in portrait, room to breathe
-      {3, 3},  // 5x5: ~88 px, slightly tighter
-      {2, 2},  // 6x6: ~73 px, unchanged
-  };
-  const NoteStyle preferred = kNoteStyle[n - 4];
+  const int minScale = kMinScale[n - 4];
 
   const int ci = puzzle_.cageOf(r, c);
   const bool hasLabel =
       ci >= 0 && puzzle_.cage(ci).op != '=' && puzzle_.cage(ci).labelCell == r * n + c;
   const int topReserve = hasLabel ? 18 : 6;  // cage label occupies the cell's top-left
 
-  // Layout: up to two marks per row, with a comma between them inside a row,
-  // e.g. "1,2" over "3,4". Keeping the comma within a row (rather than one
-  // separator spanning a wrapped list) is what makes two-per-row affordable:
-  // at 5x5 three marks plus two commas will not fit at scale 3, but two marks
-  // plus one comma will.
-  static constexpr int kPerRow = 2;
+  // Layout: up to three marks per row, comma-separated, e.g. "1,2,3" over "4".
+  // Three per row matters on 4x4: with two per row a third mark wrapped onto a
+  // second line, which read as if the list had ended. The comma sits between
+  // marks *within* a row, so a wrapped row never leaves a dangling separator.
+  static constexpr int kPerRow = 3;
+  static constexpr int kSideMargin = 4;  // breathing room at the cell edges
 
-  auto groupW = [](const int s, const int g, const int count) {
-    return count * 5 * s + (count - 1) * (s + g);  // count marks, count-1 commas
+  // A comma slot after each mark but the last. Width of a full row is
+  // kPerRow marks plus (kPerRow - 1) commas, each `commaW` wide.
+  auto commaW = [](const int s) { return s + 1; };  // narrow: comma + 1px
+  auto layoutW = [&](const int s, const int g) {
+    return kPerRow * 5 * s + (kPerRow - 1) * (commaW(s) + g);
   };
-  auto layoutW = [&](const int s, const int g) { return groupW(s, g, kPerRow); };
   const int rowsNeeded = (n + kPerRow - 1) / kPerRow;  // worst case: all marks set
   auto layoutH = [](const int s, const int g, const int rows) { return rows * 7 * s + (rows - 1) * g; };
   auto fits = [&](const int s, const int g) {
-    return layoutW(s, g) + 8 <= cellSize_ && layoutH(s, g, rowsNeeded) + 5 + topReserve <= cellSize_;
+    return layoutW(s, g) + 2 * kSideMargin <= cellSize_ &&
+           layoutH(s, g, rowsNeeded) + 5 + topReserve <= cellSize_;
   };
 
-  // Honour the preference where it fits, then step down until it does. This
-  // keeps landscape (much shorter cells) and labelled cells from overflowing
-  // without hard-coding a size per orientation.
-  int scale = preferred.scale;
-  int gap = preferred.gap;
-  while (scale > 1 && !fits(scale, gap)) {
-    if (gap > 1) {
-      --gap;
-    } else {
-      --scale;
-      gap = preferred.gap < 2 ? 2 : preferred.gap;
-    }
-  }
-  if (!fits(scale, gap)) {
-    scale = 1;
-    gap = 1;
-  }
+  // Use the largest scale that fits, starting from the board's minimum so a
+  // cramped board never falls below something legible.
+  int scale = minScale;
+  while (fits(scale + 1, 1) && scale < 9) ++scale;
+  while (scale > 1 && !fits(scale, 1)) --scale;
+  if (!fits(scale, 1)) scale = 1;
+  const int gap = std::max(1, scale);  // 1 glyph-column of space, scaled
 
-  // Advance per mark slot is a digit plus the space a comma needs after it.
-  const int slotStepX = 5 * scale + gap + (scale + 1);
+  const int slotStepX = 5 * scale + commaW(scale) + gap;
   const int slotStepY = 7 * scale + gap;
   const int startX = cellX + (cellSize_ - layoutW(scale, gap)) / 2;
   const int startY = cellY + cellSize_ - 5 - layoutH(scale, gap, rowsNeeded);
@@ -405,8 +392,8 @@ void KenKenActivity::drawNotes(const int r, const int c, const int cellX, const 
     const int col = slot % kPerRow;
     const int x = startX + col * slotStepX;
     const int y = startY + row * slotStepY;
-    // Comma sits in the gap after the previous mark, vertically low.
-    if (col > 0) drawGlyph(kCommaGlyph, x - (scale + 1) - gap, y, scale, black);
+    // Comma sits between this mark and the previous one, low on the baseline.
+    if (col > 0) drawGlyph(kCommaGlyph, x - commaW(scale) - gap, y, scale, black);
     drawBigDigit(v, x, y, scale, black);
     ++slot;
   }
