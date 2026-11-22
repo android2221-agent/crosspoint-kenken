@@ -298,14 +298,36 @@ void KenKenActivity::drawNotes(const int r, const int c, const int cellX, const 
   const uint8_t mask = notes_[r][c];
   if (mask == 0) return;
   const int n = puzzle_.n();
-  const int scale = 1;
+
+  // Pencil marks were drawn at scale 1 (a 5x7 px glyph), which is too small to
+  // read on the panel. Draw them double size, but only where a full 3-wide row
+  // of them still fits: the smallest case is 6x6 in landscape (~48 px cells),
+  // and a cell that also carries a cage label has to leave room for it at the
+  // top. Rather than hard-code a scale per level, take the largest one that
+  // fits and fall back, so every orientation and board size stays legible.
+  const int kGap = 2;
+  const int rowsNeeded = (n + 2) / 3;
+  const int ci = puzzle_.cageOf(r, c);
+  const bool hasLabel =
+      ci >= 0 && puzzle_.cage(ci).op != '=' && puzzle_.cage(ci).labelCell == r * n + c;
+  const int topReserve = hasLabel ? 18 : 6;  // cage label occupies the cell's top-left
+
+  auto layoutW = [&](const int s) { return 2 * (5 * s + kGap) + 5 * s; };  // 3 columns
+  auto layoutH = [&](const int s) { return (rowsNeeded - 1) * (7 * s + kGap) + 7 * s; };
+  auto fits = [&](const int s) {
+    return layoutW(s) + 8 <= cellSize_ && layoutH(s) + 5 + topReserve <= cellSize_;
+  };
+
+  int scale = 1;
+  if (fits(2)) scale = 2;
+
   const int digitW = 5 * scale;
   const int digitH = 7 * scale;
-  const int stepX = digitW + 4;
-  const int stepY = digitH + 3;
-  const int startX = cellX + 6;
-  const int rowsNeeded = (n + 2) / 3;
-  const int startY = cellY + cellSize_ - 6 - rowsNeeded * stepY;
+  const int stepX = digitW + kGap;
+  const int stepY = digitH + kGap;
+  const int startX = cellX + (cellSize_ - layoutW(scale)) / 2;
+  const int startY = cellY + cellSize_ - 5 - layoutH(scale);
+
   int index = 0;
   for (int v = 1; v <= n; ++v) {
     if (!(mask & (1u << v))) continue;
