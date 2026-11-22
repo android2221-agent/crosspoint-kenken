@@ -7,10 +7,27 @@
 // Button-driven KenKen (KenKen = "MathDoku"). Grid 4x4 / 5x5 / 6x6, generated on
 // the device, played with the four front buttons + the two side buttons.
 //
-// Rendering stays off the full-screen path: after the first paint every input
-// only repaints the touched cells and pushes that rectangle to the panel with
-// GfxRenderer::displayWindow(), so the screen behaves like menu navigation
-// instead of flashing a whole frame per keypress.
+// Rendering: after the first paint, every input only *draws* the touched cells
+// into the persistent framebuffer, then commits the frame with the ordinary
+// displayBuffer() path.
+//
+// Why not a windowed update: GfxRenderer::displayWindow() and the SDK's
+// EInkDisplay::displayWindow() are marked EXPERIMENTAL upstream and were never
+// exercised by any shipping activity (the upstream declaration is literally
+// commented out); this app was the first caller and, per docs, had never been
+// run on hardware. The SDK windowed path also drives the panel with the
+// ordinary fast-refresh sequence (0x22 = 0x1C) instead of the partial-update
+// sequence the SSD1677 guide documents for bounded updates (0x21 = 0x00,
+// 0x22 = 0xFC), so a windowed refresh does not get the temperature-loaded
+// waveform a partial update expects.
+//
+// Painting the dirty rectangles into the framebuffer and doing one full-frame
+// write is correct by construction: the panel always receives a complete frame
+// through the same code path every other screen in the firmware uses, so no
+// partially-driven rectangle or stale controller RAM can accumulate.
+//
+// Cost: the dirty-rect bookkeeping stays, so drawing is still cheap; only the
+// transfer grows (~48 KB, ~12 ms per the boot log). Refreshes stay FAST.
 class KenKenActivity final : public Activity {
  public:
   explicit KenKenActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
@@ -47,7 +64,6 @@ class KenKenActivity final : public Activity {
   bool statusDirty_ = false;
   bool dirty_[MAX_N][MAX_N] = {};
   int partialsSinceFull_ = 0;
-
   // Last drawn status text rect, so the next redraw can erase the old glyphs.
   int statusX_ = 0;
   int statusW_ = 0;

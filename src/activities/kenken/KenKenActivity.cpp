@@ -491,50 +491,36 @@ void KenKenActivity::render(RenderLock&&) {
     return;
   }
 
-  int left = -1;
-  int top = 0;
-  int right = 0;
-  int bottom = 0;
-  auto growWindow = [&](const int x, const int y, const int w, const int h) {
-    if (w <= 0 || h <= 0) return;
-    if (left < 0) {
-      left = x;
-      right = x + w - 1;
-      top = y;
-      bottom = y + h - 1;
-      return;
-    }
-    if (x < left) left = x;
-    if (y < top) top = y;
-    if (x + w - 1 > right) right = x + w - 1;
-    if (y + h - 1 > bottom) bottom = y + h - 1;
-  };
+  // Anything drawn this frame? Tracked as a single flag: the dirty rectangles
+  // are painted into the persistent framebuffer, and then the whole frame is
+  // committed in one go (see the header for why the windowed path is avoided).
+  bool anyDrawn = false;
 
   for (int r = 0; r < n; ++r)
     for (int c = 0; c < n; ++c) {
       if (!dirty_[r][c]) continue;
       dirty_[r][c] = false;  // clear first, for the same reason as above
       drawCell(r, c);
-      growWindow(gridX_ + c * cellSize_, gridY_ + r * cellSize_, cellSize_, cellSize_);
+      anyDrawn = true;
     }
 
-  // The status line is text, not a cell; repaint it (and include it in the
-  // window) only when its contents actually changed.
+  // The status line is text, not a cell; repaint it only when its contents
+  // actually changed.
   if (statusDirty_) {
     statusDirty_ = false;
-    const Rect statusRect = drawStatusLine();
-    growWindow(statusRect.x, statusRect.y, statusRect.width, statusRect.height);
+    drawStatusLine();
+    anyDrawn = true;
   }
 
   // Likewise, the toolbar highlight is only reachable as a whole.
   if (curRow_ == -1) {
     drawToolbar();
-    growWindow(0, toolbarY_ - 2, renderer.getScreenWidth(), toolbarH_ + 4);
+    anyDrawn = true;
   }
 
-  if (left < 0) return;
+  if (!anyDrawn) return;
 
-  renderer.displayWindow(left, top, right - left + 1, bottom - top + 1);
+  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
   partialsSinceFull_ += 1;
 
   if (partialsSinceFull_ >= 100) {
