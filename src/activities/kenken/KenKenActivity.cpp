@@ -31,10 +31,8 @@ const char* kLevelNames[] = {"4x4", "5x5", "6x6"};
 constexpr int kLevelCount = 3;
 
 // Separator drawn between pencil marks so adjacent candidates read as "1,2,3"
-// rather than a run of digits. Same 5x7 cell as the digit glyphs (bit 4 is the
-// leftmost column); only the baseline rows carry pixels, so it scales with the
-// digits without competing with them.
-const uint8_t kCommaGlyph[7] = {0x00, 0x00, 0x00, 0x00, 0x06, 0x04, 0x08};
+// rather than a run of digits. Implemented as rects in drawComma() rather than
+// a bitmap glyph: see the note there.
 
 }  // namespace
 
@@ -59,6 +57,64 @@ void KenKenActivity::computeLayout() {
   size = cellSize_ * n;
   gridX_ = (pageW - size) / 2;
   gridY_ = top + (available - size) / 2;
+
+  computeNoteStyle();
+}
+
+// Text sizing. Deliberately a plain lookup table rather than anything derived
+// from the cell size: there are exactly three boards, and someone tuning the
+// look should be able to read the answer instead of recomputing it.
+//
+//   value - every entered digit and every given clue. ONE size per board, so a
+//           number is the same size whether or not its cell also carries an
+//           arithmetic label. (It used to shrink on labelled cells.)
+//   note  - pencil marks, always smaller than a value so the two never read
+//           alike.
+//   rows  - how many rows of notes. Fixed at 2: three marks on the first row,
+//           the rest on the second.
+//
+// Notes are drawn three to a row, comma-separated, so a full note row is
+// 21 * noteScale px wide and a two-row block is 15 * noteScale px tall.
+// The largest figures below are 84 px of a 110 px 4x4 cell, which leaves room
+// for the cage label and the 3 px cage border.
+void KenKenActivity::computeNoteStyle() {
+  const int n = levelSize(levelIndex_);
+
+  // Two orientations cover all four enum values: the two portrait ones share a
+  // 480x800 screen, the two landscape ones 800x480.
+  const auto o = renderer.getOrientation();
+  const bool portrait =
+      o == GfxRenderer::Orientation::Portrait || o == GfxRenderer::Orientation::PortraitInverted;
+
+  int value = 6;
+  int note = 3;
+  if (portrait) {
+    if (n == 4) {
+      value = 8;
+      note = 4;
+    } else if (n == 5) {
+      value = 7;
+      note = 3;
+    } else {  // 6x6
+      value = 6;
+      note = 3;
+    }
+  } else {
+    if (n == 4) {
+      value = 5;
+      note = 2;
+    } else if (n == 5) {
+      value = 4;
+      note = 2;
+    } else {  // 6x6
+      value = 3;
+      note = 1;
+    }
+  }
+
+  valueScale_ = value;
+  noteScale_ = note;
+  noteRows_ = 2;
 }
 
 void KenKenActivity::onEnter() {
@@ -303,6 +359,18 @@ void KenKenActivity::loop() {
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
+// Pencil-mark separator, drawn as rects rather than a bitmap glyph so its width
+// is exactly one narrow column. A 5-column glyph at scale 5 is 10 px wide before
+// any padding, which either collided with the digit beside it or forced a slot
+// so wide the marks no longer fitted the cell. A dot with a tail hanging below
+// the baseline is what reads as a comma at this size.
+void KenKenActivity::drawComma(const int x, const int y, const int scale, const bool black) {
+  const int stroke = std::max(2, scale);
+  const int dotTop = y + 5 * scale;  // sits low in the 7-row glyph box
+  renderer.fillRect(x, dotTop, stroke, stroke, black);
+  renderer.fillRect(x - std::max(1, stroke / 3), dotTop + stroke, stroke, stroke, black);
+}
+
 void KenKenActivity::drawGlyph(const uint8_t* glyph, const int x, const int y, const int scale, const bool black) {
   for (int row = 0; row < 7; ++row) {
     const uint8_t bits = glyph[row];
@@ -338,85 +406,39 @@ void KenKenActivity::drawNotes(const int r, const int c, const int cellX, const 
   const int n = puzzle_.n();
   const int marks = __builtin_popcount(static_cast<unsigned>(mask & 0xFF));
 
-  const int ci = puzzle_.cageOf(r, c);
-  const bool hasLabel =
-      ci >= 0 && puzzle_.cage(ci).op != '=' && puzzle_.cage(ci).labelCell == r * n + c;
-  const int topReserve = hasLabel ? 18 : 6;  // cage label occupies the cell's top-left
-
-  // Layout is chosen per cell from the number of marks actually set, not from
-  // the board size: with one or two marks a single row is both roomier and
-  // clearer, and forcing a wrap there would just shrink the digits for nothing.
-  // Three or more stay on one row only if that row is still as large as the
-  // wrapped alternative — otherwise wrap, because a row that has to shrink to
-  // fit reads worse than a second line.
-  static constexpr int kSideMargin = 4;  // breathing room at the cell edges
-
-  auto commaW = [](const int s) { return s + 1; };  // narrow: comma + 1px
-  auto rowW = [&](const int s, const int g, const int marks) {
-    return marks * 5 * s + (marks - 1) * (commaW(s) + g);
-  };
-  auto blockH = [](const int s, const int g, const int rows) {
-    return rows * 7 * s + (rows - 1) * g;
-  };
-
-  // The gap is one glyph column, so it scales with the digits. The fit test has
-  // to use that same value — testing with gap 1 while drawing with gap = scale
-  // under-estimates the width and can push the block past the side margin.
-  auto gapFor = [](const int s) { return std::max(1, s); };
-  // Notes are annotations, so keep them clearly subordinate to a committed
-  // value (which draws at up to scale 9 in a 4x4 cell). Capped at roughly two
-  // thirds of the value size: at full size a single pencil mark is
-  // indistinguishable from an entered digit, which is the one thing a note must
-  // never look like.
-  const int valueScale = std::max(2, cellSize_ / (hasLabel ? 15 : 12));
-  const int noteScaleCap = std::max(2, (valueScale * 2) / 3);
-  auto largestScale = [&](const int perRow) {
-    const int rows = (marks + perRow - 1) / perRow;
-    auto fits = [&](const int s) {
-      if (s > noteScaleCap) return false;
-      const int g = gapFor(s);
-      return rowW(s, g, perRow) + 2 * kSideMargin <= cellSize_ &&
-             blockH(s, g, rows) + 5 + topReserve <= cellSize_;
-    };
-    int best = 1;
-    for (int s = 1; s <= 9 && fits(s); ++s) best = s;
-    return best;
-  };
-
-  // Candidate layouts: everything on one row, or wrapped three per row.
-  const int oneRowScale = largestScale(marks);
-  const int wrappedScale = marks > 3 ? largestScale(3) : 0;
-
-  int perRow;
-  int scale;
-  if (oneRowScale >= wrappedScale) {
-    perRow = marks;  // single row reads as one list; prefer it on a tie
-    scale = oneRowScale;
-  } else {
-    perRow = 3;
-    scale = wrappedScale;
-  }
-  if (scale < 1) scale = 1;
-  const int rows = (marks + perRow - 1) / perRow;
-  const int gap = gapFor(scale);
-  const int rowsNeeded = rows;
-
-  const int slotStepX = 5 * scale + commaW(scale) + gap;
+  // Fixed layout, no fitting or searching:
+  //   three marks per row, comma-separated, up to two rows
+  //   a mark is 5x7 cells of `scale`, plus one `scale` of gap after it
+  //   the comma gets two `scale` columns of its own
+  // Size comes from the table in computeNoteStyle(), so every cell on a board
+  // draws its marks identically.
+  const int scale = noteScale_;
+  const int comma = 2 * scale;
+  const int gap = scale;
+  const int slotStepX = 5 * scale + comma + gap;
   const int slotStepY = 7 * scale + gap;
-  const int startX = cellX + (cellSize_ - rowW(scale, gap, perRow)) / 2;
-  const int startY = cellY + cellSize_ - 5 - blockH(scale, gap, rowsNeeded);
+  const int blockH = noteRows_ * 7 * scale + (noteRows_ - 1) * gap;
+  const int startY = cellY + cellSize_ - 5 - blockH;
 
   int slot = 0;
-  for (int v = 1; v <= n; ++v) {
-    if (!(mask & (1u << v))) continue;
-    const int row = slot / perRow;
-    const int col = slot % perRow;
-    const int x = startX + col * slotStepX;
+  int row = 0;
+  while (slot < marks) {
+    const int count = std::min(3, marks - slot);
+    // A row of `count` marks with (count-1) commas between them.
+    const int rowW = count * 5 * scale + (count - 1) * (comma + gap);
+    const int rowX = cellX + (cellSize_ - rowW) / 2;
     const int y = startY + row * slotStepY;
-    // Comma sits between this mark and the previous one, low on the baseline.
-    if (col > 0) drawGlyph(kCommaGlyph, x - commaW(scale) - gap, y, scale, black);
-    drawBigDigit(v, x, y, scale, black);
-    ++slot;
+
+    int drawn = 0;
+    for (int v = 1; v <= n && drawn < count; ++v) {
+      if (!(mask & (1u << v))) continue;
+      const int x = rowX + drawn * slotStepX;
+      if (drawn > 0) drawComma(x - comma - gap + (comma - scale) / 2, y, scale, black);
+      drawBigDigit(v, x, y, scale, black);
+      ++drawn;
+    }
+    slot += count;
+    ++row;
   }
 }
 
@@ -472,7 +494,10 @@ void KenKenActivity::drawCell(const int r, const int c) {
       labelCage >= 0 && puzzle_.cage(labelCage).op != '=' && puzzle_.cage(labelCage).labelCell == r * n + c;
   if (hasLabel) drawClue(r, c, x, y, black);
 
-  const int digitScale = std::max(2, cellSize_ / (hasLabel ? 15 : 12));
+  // One digit size for the whole board (valueScale_), so a number is the same
+  // size whether or not this cell also carries an arithmetic label. The digit is
+  // nudged down on a labelled cell only to sit clear of the label, not resized.
+  const int digitScale = valueScale_;
   const int digitW = 5 * digitScale;
   const int digitH = 7 * digitScale;
   const int digitX = x + (cellSize_ - digitW) / 2;

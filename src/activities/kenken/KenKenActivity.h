@@ -81,8 +81,15 @@ class KenKenActivity final : public Activity {
   int toolbarY_ = 0;
   int toolbarH_ = 0;
 
+  // Board-level pencil-mark style, resolved once per board by computeNoteStyle()
+  // so every cell renders its marks identically. See the note there.
+  int valueScale_ = 2;
+  int noteScale_ = 1;
+  int noteRows_ = 1;
+
   static int levelSize(int levelIndex);
   void computeLayout();
+  void computeNoteStyle();
   void newPuzzle();
   void markAllDirty();
   void markDirty(int r, int c);
@@ -99,6 +106,8 @@ class KenKenActivity final : public Activity {
   // Blits a 5x7 column-major-free glyph (bit 4 = leftmost column) at `scale`.
   // Shared by the digits and the comma separator between pencil marks.
   void drawGlyph(const uint8_t* glyph, int x, int y, int scale, bool black);
+  // Narrow comma separator between pencil marks (rect-drawn, ~1 stroke wide).
+  void drawComma(int x, int y, int scale, bool black);
   void drawBigDigit(int value, int x, int y, int scale, bool black);
   void drawNotes(int r, int c, int cellX, int cellY, bool black);
   void drawClue(int r, int c, int cellX, int cellY, bool black);
