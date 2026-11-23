@@ -4,7 +4,10 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+#include <HalStorage.h>
 
 #include "I18n.h"
 #include "components/UITheme.h"
@@ -30,6 +33,10 @@ const uint8_t kDigits[10][7] = {
 const char* kLevelNames[] = {"4x4", "5x5", "6x6"};
 constexpr int kLevelCount = 3;
 
+// Separator drawn between pencil marks so adjacent candidates read as "1,2,3"
+// rather than a run of digits. Implemented as rects in drawComma() rather than
+// a bitmap glyph: see the note there.
+
 }  // namespace
 
 int KenKenActivity::levelSize(const int levelIndex) { return 4 + levelIndex; }
@@ -53,12 +60,244 @@ void KenKenActivity::computeLayout() {
   size = cellSize_ * n;
   gridX_ = (pageW - size) / 2;
   gridY_ = top + (available - size) / 2;
+
+  computeNoteStyle();
+}
+
+// Text sizing. Deliberately a plain lookup table rather than anything derived
+// from the cell size: there are exactly three boards, and someone tuning the
+// look should be able to read the answer instead of recomputing it.
+//
+//   value - every entered digit and every given clue. ONE size per board, so a
+//           number is the same size whether or not its cell also carries an
+//           arithmetic label. (It used to shrink on labelled cells.)
+//   note  - pencil marks, always smaller than a value so the two never read
+//           alike.
+//   rows  - how many rows of notes. Fixed at 2: three marks on the first row,
+//           the rest on the second.
+//
+// Notes are drawn three to a row, comma-separated, so a full note row is
+// 21 * noteScale px wide and a two-row block is 15 * noteScale px tall.
+// The largest figures below are 84 px of a 110 px 4x4 cell, which leaves room
+// for the cage label and the 3 px cage border.
+void KenKenActivity::computeNoteStyle() {
+  const int n = levelSize(levelIndex_);
+
+  // Two orientations cover all four enum values: the two portrait ones share a
+  // 480x800 screen, the two landscape ones 800x480.
+  const auto o = renderer.getOrientation();
+  const bool portrait =
+      o == GfxRenderer::Orientation::Portrait || o == GfxRenderer::Orientation::PortraitInverted;
+
+  int value = 6;
+  int note = 3;
+  if (portrait) {
+    if (n == 4) {
+      value = 8;
+      note = 4;
+    } else if (n == 5) {
+      value = 7;
+      note = 3;
+    } else {  // 6x6
+      value = 6;
+      note = 3;
+    }
+  } else {
+    if (n == 4) {
+      value = 5;
+      note = 2;
+    } else if (n == 5) {
+      value = 4;
+      note = 2;
+    } else {  // 6x6
+      value = 3;
+      note = 1;
+    }
+  }
+
+  valueScale_ = value;
+  noteScale_ = note;
+  noteRows_ = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Save / resume
+//
+// The generator is deterministic — everything (Latin square, cages, operators,
+// targets, givens) follows from a single 32-bit seed — so the save file only
+// has to hold the seed, the level, and the player's values and notes. That is
+// ~90 bytes instead of a serialised board.
+//
+// Written on exit (which also runs before deep sleep) and whenever a new board
+// is created. Never on a keystroke: SPIFFS sectors have a finite erase budget.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr const char* kSavePath = "/.crosspoint/kenken.txt";
+constexpr int kSaveVersion = 1;
+
+// Strict integer parse of s[start, end). Returns false for empty or non-numeric
+// text: String::toInt() would quietly give 0, turning a corrupt save into a
+// board full of blanks.
+bool parseField(const String& s, const int start, const int end, int& out) {
+  if (end <= start) return false;
+  int value = 0;
+  for (int i = start; i < end; ++i) {
+    const char ch = s[i];
+    if (ch < '0' || ch > '9') return false;
+    value = value * 10 + (ch - '0');
+    if (value > 100000) return false;  // nothing we write is this large
+  }
+  out = value;
+  return true;
+}
+}  // namespace
+
+bool KenKenActivity::saveGame() {
+  if (!Storage.ready()) return false;  // no SD card: play continues, nothing persists
+  const int n = levelSize(levelIndex_);
+  if (puzzle_.n() != n) return false;
+
+  // One line per value/note row keeps the format trivially greppable.
+  String out;
+  out.reserve(320);
+  out += "kenken ";
+  out += String(kSaveVersion);
+  out += " ";
+  out += String(static_cast<unsigned long>(seed_));
+  out += " ";
+  out += String(levelIndex_);
+  out += "\n";
+  for (int r = 0; r < n; ++r) {
+    for (int c = 0; c < n; ++c) {
+      out += String(static_cast<int>(values_[r][c]));
+      out += ',';
+    }
+    out += '\n';
+  }
+  for (int r = 0; r < n; ++r) {
+    for (int c = 0; c < n; ++c) {
+      out += String(static_cast<int>(notes_[r][c]));
+      out += ',';
+    }
+    out += '\n';
+  }
+
+  if (!Storage.ensureDirectoryExists("/.crosspoint")) return false;
+  const bool ok = Storage.writeFile(kSavePath, out);
+  if (!ok) LOG_ERR("KK", "save failed");
+  return ok;
+}
+
+bool KenKenActivity::loadGame() {
+  if (!Storage.ready()) return false;
+  if (!Storage.exists(kSavePath)) return false;
+
+  String in = Storage.readFile(kSavePath);
+  if (in.isEmpty()) return false;
+
+  // Reject anything that is not ours or not this format version.
+  if (!in.startsWith("kenken ")) return false;
+
+  int pos = 7;
+  const int version = in.substring(pos).toInt();
+  if (version != kSaveVersion) return false;
+  pos = in.indexOf(' ', pos) + 1;
+  if (pos <= 0) return false;
+
+  // Parse as UNSIGNED. String::toInt() is atol(), i.e. signed 32-bit, and half
+  // of all uint32 seeds exceed INT32_MAX — those would clamp and restore a
+  // different board under the player's entries.
+  const uint32_t seed = static_cast<uint32_t>(strtoul(in.c_str() + pos, nullptr, 10));
+  pos = in.indexOf(' ', pos) + 1;
+  if (pos <= 0) return false;
+
+  const int savedLevel = in.substring(pos).toInt();
+  if (savedLevel < 0 || savedLevel >= kLevelCount) return false;
+  pos = in.indexOf('\n', pos);
+  if (pos < 0) return false;
+  ++pos;
+
+  const int n = levelSize(savedLevel);
+  if (savedLevel != levelIndex_) {
+    // Keep the saved level rather than discard the game: the player was on that
+    // board when they left.
+    levelIndex_ = savedLevel;
+    computeLayout();
+  }
+
+  // Rebuild the exact board from the seed.
+  puzzle_.generate(n, seed);
+  if (!puzzle_.ready() || puzzle_.n() != n) return false;
+  seed_ = seed;
+
+  memset(values_, 0, sizeof(values_));
+  memset(notes_, 0, sizeof(notes_));
+  memset(wrong_, 0, sizeof(wrong_));
+
+  // Values: must be a plain number in 0..n. Anything else means the file is not
+  // what we wrote, so reject the whole save rather than restore a half-garbage
+  // board under the player's eyes.
+  for (int r = 0; r < n; ++r) {
+    for (int c = 0; c < n; ++c) {
+      const int comma = in.indexOf(',', pos);
+      if (comma < 0) return false;
+      int v = 0;
+      if (!parseField(in, pos, comma, v) || v < 0 || v > n) return false;
+      values_[r][c] = static_cast<int8_t>(v);
+      pos = comma + 1;
+    }
+    const int nl = in.indexOf('\n', pos);
+    if (nl < 0) return false;
+    pos = nl + 1;
+  }
+  // Notes: a bitmask, bit v = candidate v. Only bits 1..n are ever set.
+  const int noteMask = (1 << (n + 1)) - 1;
+  for (int r = 0; r < n; ++r) {
+    for (int c = 0; c < n; ++c) {
+      const int comma = in.indexOf(',', pos);
+      if (comma < 0) return false;
+      int v = 0;
+      if (!parseField(in, pos, comma, v) || v < 0 || (v & ~noteMask) != 0) return false;
+      notes_[r][c] = static_cast<uint8_t>(v);
+      pos = comma + 1;
+    }
+    const int nl = in.indexOf('\n', pos);
+    if (nl >= 0) pos = nl + 1;  // last row may end at EOF
+  }
+
+  // Recompute derived state from what was restored.
+  filled_ = 0;
+  for (int r = 0; r < n; ++r)
+    for (int c = 0; c < n; ++c) {
+      if (puzzle_.isClue(r, c)) ++filled_;
+      else if (values_[r][c] > 0) ++filled_;
+    }
+  solved_ = false;
+  checked_ = false;
+  editing_ = false;
+  curRow_ = 0;
+  curCol_ = 0;
+  toolIndex_ = 0;
+  partialsSinceFull_ = 0;
+  computeLayout();
+  markAllDirty();
+  requestUpdate();
+  LOG_DBG("KK", "Resumed saved game (level %d)", savedLevel);
+  return true;
+}
+
+void KenKenActivity::onExit() {
+  saveGame();
+  Activity::onExit();
 }
 
 void KenKenActivity::onEnter() {
   Activity::onEnter();
   computeLayout();
-  newPuzzle();
+  // Resume the board the player left, including their entries, until they press
+  // New. Only fall back to generating when there is nothing saved or the save
+  // does not match this level.
+  if (!loadGame()) newPuzzle();
 }
 
 void KenKenActivity::markAllDirty() {
@@ -71,14 +310,8 @@ void KenKenActivity::markDirty(const int r, const int c) {
   dirty_[r][c] = true;
 }
 
-void KenKenActivity::newPuzzle() {
+void KenKenActivity::resetEntries() {
   const int n = levelSize(levelIndex_);
-  // Seed from the clock plus the level so two boards in a row differ. Generation
-  // almost always succeeds first time; retry rather than show an empty grid.
-  for (int attempt = 0; attempt < 3; ++attempt) {
-    puzzle_.generate(n, static_cast<uint32_t>(millis() * 2654435761u + n * 7919u + attempt * 104729u));
-    if (puzzle_.ready()) break;
-  }
   memset(values_, 0, sizeof(values_));
   memset(notes_, 0, sizeof(notes_));
   memset(wrong_, 0, sizeof(wrong_));
@@ -96,6 +329,19 @@ void KenKenActivity::newPuzzle() {
   computeLayout();
   markAllDirty();
   requestUpdate();
+}
+
+void KenKenActivity::newPuzzle() {
+  const int n = levelSize(levelIndex_);
+  // Seed from the clock plus the level so two boards in a row differ. Generation
+  // almost always succeeds first time; retry rather than show an empty grid.
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    seed_ = static_cast<uint32_t>(millis() * 2654435761u + n * 7919u + attempt * 104729u);
+    puzzle_.generate(n, seed_);
+    if (puzzle_.ready()) break;
+  }
+  resetEntries();
+  saveGame();
 }
 
 // ---------------------------------------------------------------------------
@@ -120,18 +366,31 @@ void KenKenActivity::loop() {
   }
 
   if (editing_) {
-    if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
-      candidate_ = (candidate_ - 1 + (n + 1)) % (n + 1);
+    // Candidate selection. The front Left/Right buttons and the side Up/Down
+    // buttons both step through 1..n then blank, so either hand can drive it:
+    // the side buttons are far easier to reach while holding the device.
+    int delta = 0;
+    if (mappedInput.wasReleased(MappedInputManager::Button::Left) ||
+        mappedInput.wasReleased(MappedInputManager::Button::Down)) {
+      delta = -1;
+    } else if (mappedInput.wasReleased(MappedInputManager::Button::Right) ||
+               mappedInput.wasReleased(MappedInputManager::Button::Up)) {
+      delta = +1;
+    }
+    if (delta != 0) {
+      candidate_ = (candidate_ + delta + (n + 1)) % (n + 1);
       markDirty(curRow_, curCol_);
       requestUpdate();
-    } else if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
-      candidate_ = (candidate_ + 1) % (n + 1);
-      markDirty(curRow_, curCol_);
-      requestUpdate();
-    } else if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+      return;
+    }
+    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
       const int before = values_[curRow_][curCol_];
       const bool wasChecked = checked_;
-      if (notesMode_) {
+      // Tap = pencil mark, hold = real value (see LONG_PRESS_MS). Measured on
+      // release, so holding then letting go still commits.
+      const bool asValue = mappedInput.getHeldTime() >= LONG_PRESS_MS;
+
+      if (!asValue) {
         // Pencil marks only mean anything on an empty cell; on a filled cell
         // they are invisible (the value is drawn over them) so ignore them.
         if (candidate_ > 0 && before == 0) notes_[curRow_][curCol_] ^= static_cast<uint8_t>(1u << candidate_);
@@ -143,6 +402,25 @@ void KenKenActivity::loop() {
         // corrupt the count and could trigger a bogus "solved").
         if (before == 0 && candidate_ != 0) ++filled_;
         if (before != 0 && candidate_ == 0) --filled_;
+
+        // Strip this value from the pencil marks of every other cell in the row
+        // and column. KenKen's row/column rule is the same as a Latin square's,
+        // so a committed digit can never be a valid candidate elsewhere in
+        // either line; leaving those marks behind just fills the board with
+        // candidates that have already been disproven.
+        if (candidate_ > 0) {
+          const uint8_t clearedBit = static_cast<uint8_t>(~(1u << candidate_));
+          for (int i = 0; i < n; ++i) {
+            if (i != curCol_ && notes_[curRow_][i] != 0) {
+              notes_[curRow_][i] &= clearedBit;
+              dirty_[curRow_][i] = true;
+            }
+            if (i != curRow_ && notes_[i][curCol_] != 0) {
+              notes_[i][curCol_] &= clearedBit;
+              dirty_[i][curCol_] = true;
+            }
+          }
+        }
       }
       wrong_[curRow_][curCol_] = false;
       if (wasChecked) {
@@ -226,10 +504,6 @@ void KenKenActivity::loop() {
           fullRedraw_ = true;
           newPuzzle();
           return;
-        case TOOL_NOTES:
-          notesMode_ = !notesMode_;
-          markAllDirty();
-          break;
         case TOOL_CHECK: {
           checked_ = true;
           int bad = 0;
@@ -269,17 +543,33 @@ void KenKenActivity::loop() {
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
-void KenKenActivity::drawBigDigit(const int value, const int x, const int y, const int scale, const bool black) {
-  if (value < 0 || value > 9) return;
-  const uint8_t* glyph = kDigits[value];
+// Pencil-mark separator, drawn as rects rather than a bitmap glyph so its width
+// is exactly one narrow column. A 5-column glyph at scale 5 is 10 px wide before
+// any padding, which either collided with the digit beside it or forced a slot
+// so wide the marks no longer fitted the cell. A dot with a tail hanging below
+// the baseline is what reads as a comma at this size.
+void KenKenActivity::drawComma(const int x, const int y, const int scale, const bool black) {
+  const int stroke = std::max(2, scale);
+  const int dotTop = y + 5 * scale;  // sits low in the 7-row glyph box
+  renderer.fillRect(x, dotTop, stroke, stroke, black);
+  renderer.fillRect(x - std::max(1, stroke / 3), dotTop + stroke, stroke, stroke, black);
+}
+
+void KenKenActivity::drawGlyph(const uint8_t* glyph, const int x, const int y, const int scale, const bool black) {
   for (int row = 0; row < 7; ++row) {
     const uint8_t bits = glyph[row];
+    if (bits == 0) continue;
     for (int col = 0; col < 5; ++col) {
       if (bits & (1u << (4 - col))) {
         renderer.fillRect(x + col * scale, y + row * scale, scale, scale, black);
       }
     }
   }
+}
+
+void KenKenActivity::drawBigDigit(const int value, const int x, const int y, const int scale, const bool black) {
+  if (value < 0 || value > 9) return;
+  drawGlyph(kDigits[value], x, y, scale, black);
 }
 
 void KenKenActivity::drawClue(const int r, const int c, const int cellX, const int cellY, const bool black) {
@@ -298,21 +588,41 @@ void KenKenActivity::drawNotes(const int r, const int c, const int cellX, const 
   const uint8_t mask = notes_[r][c];
   if (mask == 0) return;
   const int n = puzzle_.n();
-  const int scale = 1;
-  const int digitW = 5 * scale;
-  const int digitH = 7 * scale;
-  const int stepX = digitW + 4;
-  const int stepY = digitH + 3;
-  const int startX = cellX + 6;
-  const int rowsNeeded = (n + 2) / 3;
-  const int startY = cellY + cellSize_ - 6 - rowsNeeded * stepY;
-  int index = 0;
-  for (int v = 1; v <= n; ++v) {
-    if (!(mask & (1u << v))) continue;
-    const int col = index % 3;
-    const int row = index / 3;
-    drawBigDigit(v, startX + col * stepX, startY + row * stepY, scale, black);
-    ++index;
+  const int marks = __builtin_popcount(static_cast<unsigned>(mask & 0xFF));
+
+  // Fixed layout, no fitting or searching:
+  //   three marks per row, comma-separated, up to two rows
+  //   a mark is 5x7 cells of `scale`, plus one `scale` of gap after it
+  //   the comma gets two `scale` columns of its own
+  // Size comes from the table in computeNoteStyle(), so every cell on a board
+  // draws its marks identically.
+  const int scale = noteScale_;
+  const int comma = 2 * scale;
+  const int gap = scale;
+  const int slotStepX = 5 * scale + comma + gap;
+  const int slotStepY = 7 * scale + gap;
+  const int blockH = noteRows_ * 7 * scale + (noteRows_ - 1) * gap;
+  const int startY = cellY + cellSize_ - 5 - blockH;
+
+  int slot = 0;
+  int row = 0;
+  while (slot < marks) {
+    const int count = std::min(3, marks - slot);
+    // A row of `count` marks with (count-1) commas between them.
+    const int rowW = count * 5 * scale + (count - 1) * (comma + gap);
+    const int rowX = cellX + (cellSize_ - rowW) / 2;
+    const int y = startY + row * slotStepY;
+
+    int drawn = 0;
+    for (int v = 1; v <= n && drawn < count; ++v) {
+      if (!(mask & (1u << v))) continue;
+      const int x = rowX + drawn * slotStepX;
+      if (drawn > 0) drawComma(x - comma - gap + (comma - scale) / 2, y, scale, black);
+      drawBigDigit(v, x, y, scale, black);
+      ++drawn;
+    }
+    slot += count;
+    ++row;
   }
 }
 
@@ -368,7 +678,10 @@ void KenKenActivity::drawCell(const int r, const int c) {
       labelCage >= 0 && puzzle_.cage(labelCage).op != '=' && puzzle_.cage(labelCage).labelCell == r * n + c;
   if (hasLabel) drawClue(r, c, x, y, black);
 
-  const int digitScale = std::max(2, cellSize_ / (hasLabel ? 15 : 12));
+  // One digit size for the whole board (valueScale_), so a number is the same
+  // size whether or not this cell also carries an arithmetic label. The digit is
+  // nudged down on a labelled cell only to sit clear of the label, not resized.
+  const int digitScale = valueScale_;
   const int digitW = 5 * digitScale;
   const int digitH = 7 * digitScale;
   const int digitX = x + (cellSize_ - digitW) / 2;
@@ -402,7 +715,6 @@ void KenKenActivity::drawToolbar() {
   const int pillW = (pageW - 2 * margin - (TOOL_COUNT - 1) * gap) / TOOL_COUNT;
   char labels[TOOL_COUNT][16];
   snprintf(labels[TOOL_LEVEL], sizeof(labels[0]), "%s", kLevelNames[levelIndex_]);
-  snprintf(labels[TOOL_NOTES], sizeof(labels[0]), "%s", notesMode_ ? "Notes:on" : "Notes:off");
   snprintf(labels[TOOL_CHECK], sizeof(labels[0]), "Check");
   snprintf(labels[TOOL_NEW], sizeof(labels[0]), "New");
 
@@ -468,7 +780,11 @@ void KenKenActivity::drawAll() {
 
   // Keep the hint bar independent of editing_: partial repaints never touch it,
   // so a mode-dependent bar would be left showing the previous mode's labels.
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
+  // Confirm now means "note" on a tap and "set the value" on a hold. Keep the
+  // label short: drawButtonHints draws a fixed 80 px button and does not clip,
+  // so anything longer bleeds past the border. The tap/hold distinction is
+  // spelled out in the app's README and the status line instead.
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), "Note/Set", tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 }
 
