@@ -34,6 +34,7 @@ class KenKenActivity final : public Activity {
       : Activity("KenKen", renderer, mappedInput) {}
 
   void onEnter() override;
+  void onExit() override;
   void loop() override;
   void render(RenderLock&&) override;
   bool skipLoopDelay() override { return true; }
@@ -81,6 +82,14 @@ class KenKenActivity final : public Activity {
   int toolbarY_ = 0;
   int toolbarH_ = 0;
 
+  // Seed that produced the current board. The generator is deterministic, so
+  // this one value is enough to rebuild the puzzle exactly: save/restore writes
+  // the seed plus the player's entries, not the whole grid.
+  uint32_t seed_ = 0;
+
+  bool saveGame();
+  bool loadGame();
+
   // Board-level pencil-mark style, resolved once per board by computeNoteStyle()
   // so every cell renders its marks identically. See the note there.
   int valueScale_ = 2;
@@ -91,6 +100,8 @@ class KenKenActivity final : public Activity {
   void computeLayout();
   void computeNoteStyle();
   void newPuzzle();
+  // Clears entries and derived state without regenerating the board.
+  void resetEntries();
   void markAllDirty();
   void markDirty(int r, int c);
 

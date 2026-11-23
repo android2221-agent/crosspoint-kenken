@@ -4,7 +4,10 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+#include <HalStorage.h>
 
 #include "I18n.h"
 #include "components/UITheme.h"
@@ -117,10 +120,184 @@ void KenKenActivity::computeNoteStyle() {
   noteRows_ = 2;
 }
 
+// ---------------------------------------------------------------------------
+// Save / resume
+//
+// The generator is deterministic — everything (Latin square, cages, operators,
+// targets, givens) follows from a single 32-bit seed — so the save file only
+// has to hold the seed, the level, and the player's values and notes. That is
+// ~90 bytes instead of a serialised board.
+//
+// Written on exit (which also runs before deep sleep) and whenever a new board
+// is created. Never on a keystroke: SPIFFS sectors have a finite erase budget.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr const char* kSavePath = "/.crosspoint/kenken.txt";
+constexpr int kSaveVersion = 1;
+
+// Strict integer parse of s[start, end). Returns false for empty or non-numeric
+// text: String::toInt() would quietly give 0, turning a corrupt save into a
+// board full of blanks.
+bool parseField(const String& s, const int start, const int end, int& out) {
+  if (end <= start) return false;
+  int value = 0;
+  for (int i = start; i < end; ++i) {
+    const char ch = s[i];
+    if (ch < '0' || ch > '9') return false;
+    value = value * 10 + (ch - '0');
+    if (value > 100000) return false;  // nothing we write is this large
+  }
+  out = value;
+  return true;
+}
+}  // namespace
+
+bool KenKenActivity::saveGame() {
+  if (!Storage.ready()) return false;  // no SD card: play continues, nothing persists
+  const int n = levelSize(levelIndex_);
+  if (puzzle_.n() != n) return false;
+
+  // One line per value/note row keeps the format trivially greppable.
+  String out;
+  out.reserve(320);
+  out += "kenken ";
+  out += String(kSaveVersion);
+  out += " ";
+  out += String(static_cast<unsigned long>(seed_));
+  out += " ";
+  out += String(levelIndex_);
+  out += "\n";
+  for (int r = 0; r < n; ++r) {
+    for (int c = 0; c < n; ++c) {
+      out += String(static_cast<int>(values_[r][c]));
+      out += ',';
+    }
+    out += '\n';
+  }
+  for (int r = 0; r < n; ++r) {
+    for (int c = 0; c < n; ++c) {
+      out += String(static_cast<int>(notes_[r][c]));
+      out += ',';
+    }
+    out += '\n';
+  }
+
+  if (!Storage.ensureDirectoryExists("/.crosspoint")) return false;
+  const bool ok = Storage.writeFile(kSavePath, out);
+  if (!ok) LOG_ERR("KK", "save failed");
+  return ok;
+}
+
+bool KenKenActivity::loadGame() {
+  if (!Storage.ready()) return false;
+  if (!Storage.exists(kSavePath)) return false;
+
+  String in = Storage.readFile(kSavePath);
+  if (in.isEmpty()) return false;
+
+  // Reject anything that is not ours or not this format version.
+  if (!in.startsWith("kenken ")) return false;
+
+  int pos = 7;
+  const int version = in.substring(pos).toInt();
+  if (version != kSaveVersion) return false;
+  pos = in.indexOf(' ', pos) + 1;
+  if (pos <= 0) return false;
+
+  // Parse as UNSIGNED. String::toInt() is atol(), i.e. signed 32-bit, and half
+  // of all uint32 seeds exceed INT32_MAX — those would clamp and restore a
+  // different board under the player's entries.
+  const uint32_t seed = static_cast<uint32_t>(strtoul(in.c_str() + pos, nullptr, 10));
+  pos = in.indexOf(' ', pos) + 1;
+  if (pos <= 0) return false;
+
+  const int savedLevel = in.substring(pos).toInt();
+  if (savedLevel < 0 || savedLevel >= kLevelCount) return false;
+  pos = in.indexOf('\n', pos);
+  if (pos < 0) return false;
+  ++pos;
+
+  const int n = levelSize(savedLevel);
+  if (savedLevel != levelIndex_) {
+    // Keep the saved level rather than discard the game: the player was on that
+    // board when they left.
+    levelIndex_ = savedLevel;
+    computeLayout();
+  }
+
+  // Rebuild the exact board from the seed.
+  puzzle_.generate(n, seed);
+  if (!puzzle_.ready() || puzzle_.n() != n) return false;
+  seed_ = seed;
+
+  memset(values_, 0, sizeof(values_));
+  memset(notes_, 0, sizeof(notes_));
+  memset(wrong_, 0, sizeof(wrong_));
+
+  // Values: must be a plain number in 0..n. Anything else means the file is not
+  // what we wrote, so reject the whole save rather than restore a half-garbage
+  // board under the player's eyes.
+  for (int r = 0; r < n; ++r) {
+    for (int c = 0; c < n; ++c) {
+      const int comma = in.indexOf(',', pos);
+      if (comma < 0) return false;
+      int v = 0;
+      if (!parseField(in, pos, comma, v) || v < 0 || v > n) return false;
+      values_[r][c] = static_cast<int8_t>(v);
+      pos = comma + 1;
+    }
+    const int nl = in.indexOf('\n', pos);
+    if (nl < 0) return false;
+    pos = nl + 1;
+  }
+  // Notes: a bitmask, bit v = candidate v. Only bits 1..n are ever set.
+  const int noteMask = (1 << (n + 1)) - 1;
+  for (int r = 0; r < n; ++r) {
+    for (int c = 0; c < n; ++c) {
+      const int comma = in.indexOf(',', pos);
+      if (comma < 0) return false;
+      int v = 0;
+      if (!parseField(in, pos, comma, v) || v < 0 || (v & ~noteMask) != 0) return false;
+      notes_[r][c] = static_cast<uint8_t>(v);
+      pos = comma + 1;
+    }
+    const int nl = in.indexOf('\n', pos);
+    if (nl >= 0) pos = nl + 1;  // last row may end at EOF
+  }
+
+  // Recompute derived state from what was restored.
+  filled_ = 0;
+  for (int r = 0; r < n; ++r)
+    for (int c = 0; c < n; ++c) {
+      if (puzzle_.isClue(r, c)) ++filled_;
+      else if (values_[r][c] > 0) ++filled_;
+    }
+  solved_ = false;
+  checked_ = false;
+  editing_ = false;
+  curRow_ = 0;
+  curCol_ = 0;
+  toolIndex_ = 0;
+  partialsSinceFull_ = 0;
+  computeLayout();
+  markAllDirty();
+  requestUpdate();
+  LOG_DBG("KK", "Resumed saved game (level %d)", savedLevel);
+  return true;
+}
+
+void KenKenActivity::onExit() {
+  saveGame();
+  Activity::onExit();
+}
+
 void KenKenActivity::onEnter() {
   Activity::onEnter();
   computeLayout();
-  newPuzzle();
+  // Resume the board the player left, including their entries, until they press
+  // New. Only fall back to generating when there is nothing saved or the save
+  // does not match this level.
+  if (!loadGame()) newPuzzle();
 }
 
 void KenKenActivity::markAllDirty() {
@@ -133,14 +310,8 @@ void KenKenActivity::markDirty(const int r, const int c) {
   dirty_[r][c] = true;
 }
 
-void KenKenActivity::newPuzzle() {
+void KenKenActivity::resetEntries() {
   const int n = levelSize(levelIndex_);
-  // Seed from the clock plus the level so two boards in a row differ. Generation
-  // almost always succeeds first time; retry rather than show an empty grid.
-  for (int attempt = 0; attempt < 3; ++attempt) {
-    puzzle_.generate(n, static_cast<uint32_t>(millis() * 2654435761u + n * 7919u + attempt * 104729u));
-    if (puzzle_.ready()) break;
-  }
   memset(values_, 0, sizeof(values_));
   memset(notes_, 0, sizeof(notes_));
   memset(wrong_, 0, sizeof(wrong_));
@@ -158,6 +329,19 @@ void KenKenActivity::newPuzzle() {
   computeLayout();
   markAllDirty();
   requestUpdate();
+}
+
+void KenKenActivity::newPuzzle() {
+  const int n = levelSize(levelIndex_);
+  // Seed from the clock plus the level so two boards in a row differ. Generation
+  // almost always succeeds first time; retry rather than show an empty grid.
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    seed_ = static_cast<uint32_t>(millis() * 2654435761u + n * 7919u + attempt * 104729u);
+    puzzle_.generate(n, seed_);
+    if (puzzle_.ready()) break;
+  }
+  resetEntries();
+  saveGame();
 }
 
 // ---------------------------------------------------------------------------
